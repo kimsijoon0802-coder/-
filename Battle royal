@@ -1,0 +1,299 @@
+from zipfile import ZipFile
+import os
+
+# 파일 구조 정의
+base_dir = "battle-royale-advanced"
+public_dir = os.path.join(base_dir, "public")
+os.makedirs(public_dir, exist_ok=True)
+
+# 파일들 생성
+files = {
+    os.path.join(base_dir, "package.json"): '''
+{
+  "name": "battle-royale-advanced",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
+''',
+
+    os.path.join(base_dir, "server.js"): '''
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+const PORT = 3000;
+
+app.use(express.static('public'));
+
+const players = {};
+
+let zone = {
+  x: 300,
+  y: 200,
+  radius: 250,
+  shrinkTargetRadius: 50,
+  shrinking: false
+};
+
+const ZONE_SHRINK_TIME = 30000;
+const ZONE_WAIT_TIME = 20000;
+const OUTSIDE_DAMAGE = 5;
+
+function scheduleZoneShrink() {
+  setTimeout(() => {
+    zone.shrinking = true;
+    const startRadius = zone.radius;
+    const endRadius = Math.max(zone.shrinkTargetRadius, 50);
+    const shrinkStartTime = Date.now();
+
+    const shrinkInterval = setInterval(() => {
+      const elapsed = Date.now() - shrinkStartTime;
+      const t = Math.min(elapsed / ZONE_SHRINK_TIME, 1);
+      zone.radius = startRadius + (endRadius - startRadius) * t;
+
+      io.emit('zoneUpdate', { x: zone.x, y: zone.y, radius: zone.radius });
+
+      if (t >= 1) {
+        clearInterval(shrinkInterval);
+        zone.shrinking = false;
+        scheduleZoneShrink();
+      }
+    }, 1000 / 30);
+
+  }, ZONE_WAIT_TIME);
+}
+
+function damageOutsidePlayers() {
+  setInterval(() => {
+    for (const id in players) {
+      const p = players[id];
+      if (!p.alive) continue;
+      const dx = p.x - zone.x;
+      const dy = p.y - zone.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > zone.radius) {
+        p.hp -= OUTSIDE_DAMAGE;
+        if (p.hp <= 0) {
+          p.alive = false;
+          io.emit('playerDied', { id: id });
+        }
+        io.to(id).emit('hpUpdate', { hp: p.hp });
+      }
+    }
+    io.emit('playersUpdate', players);
+  }, 1000);
+}
+
+io.on('connection', (socket) => {
+  console.log('유저 접속:', socket.id);
+
+  socket.on('joinGame', (name) => {
+    players[socket.id] = {
+      x: Math.random() * 600,
+      y: Math.random() * 400,
+      name: name || 'Player',
+      alive: true,
+      hp: 100
+    };
+    socket.emit('currentPlayers', players);
+    socket.emit('zoneUpdate', zone);
+    socket.broadcast.emit('newPlayer', { id: socket.id, info: players[socket.id] });
+  });
+
+  socket.on('playerMove', (data) => {
+    const p = players[socket.id];
+    if (!p || !p.alive) return;
+    p.x = data.x;
+    p.y = data.y;
+    socket.broadcast.emit('playerMoved', { id: socket.id, x: p.x, y: p.y });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('접속 끊김:', socket.id);
+    delete players[socket.id];
+    io.emit('playerDisconnected', { id: socket.id });
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`서버 실행 중: http://localhost:${PORT}`);
+  scheduleZoneShrink();
+  damageOutsidePlayers();
+});
+''',
+
+    os.path.join(public_dir, "index.html"): '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>배틀로얄 고급 예제</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="ui">
+    <input type="text" id="nameInput" placeholder="이름 입력">
+    <button id="joinBtn">참가</button>
+    <div id="hp">HP: 100</div>
+    <div id="status">생존자 수: 0</div>
+  </div>
+  <canvas id="gameCanvas" width="600" height="400"></canvas>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
+''',
+
+    os.path.join(public_dir, "style.css"): '''
+body {
+  margin: 0;
+  overflow: hidden;
+  background-color: #222;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+#ui {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 100;
+}
+
+#hp, #status {
+  margin-top: 5px;
+}
+
+canvas {
+  display: block;
+  margin: auto;
+  background-color: #444;
+}
+''',
+
+    os.path.join(public_dir, "client.js"): '''
+const socket = io();
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+let players = {};
+let myId = null;
+let myHp = 100;
+let zone = { x: 300, y: 200, radius: 250 };
+
+const speed = 2;
+const keys = {};
+
+const nameInput = document.getElementById('nameInput');
+const joinBtn = document.getElementById('joinBtn');
+const hpDiv = document.getElementById('hp');
+const statusDiv = document.getElementById('status');
+
+joinBtn.onclick = () => {
+  const name = nameInput.value || 'Player';
+  socket.emit('joinGame', name);
+};
+
+socket.on('currentPlayers', (serverPlayers) => {
+  players = serverPlayers;
+  myId = socket.id;
+  updateStatus();
+  draw();
+});
+
+socket.on('newPlayer', ({ id, info }) => {
+  players[id] = info;
+  updateStatus();
+  draw();
+});
+
+socket.on('playerMoved', ({ id, x, y }) => {
+  if (players[id]) {
+    players[id].x = x;
+    players[id].y = y;
+    draw();
+  }
+});
+
+socket.on('playersUpdate', (serverPlayers) => {
+  players = serverPlayers;
+  updateStatus();
+  draw();
+});
+
+socket.on('playerDied', ({ id }) => {
+  if (players[id]) {
+    players[id].alive = false;
+    draw();
+    updateStatus();
+  }
+});
+
+socket.on('hpUpdate', ({ hp }) => {
+  if (myHp !== hp) {
+    myHp = hp;
+    hpDiv.innerText = `HP: ${Math.max(0, Math.floor(myHp))}`;
+  }
+});
+
+socket.on('zoneUpdate', (z) => {
+  zone = z;
+  draw();
+});
+
+window.addEventListener('keydown', (e) => { keys[e.key] = true; });
+window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+
+function updateMovement() {
+  if (!myId || !players[myId] || !players[myId].alive) return;
+  let moved = false;
+  let x = players[myId].x;
+  let y = players[myId].y;
+  if (keys['ArrowUp'] || keys['w']) { y -= speed; moved = true; }
+  if (keys['ArrowDown'] || keys['s']) { y += speed; moved = true; }
+  if (keys['ArrowLeft'] || keys['a']) { x -= speed; moved = true; }
+  if (keys['ArrowRight'] || keys['d']) { x += speed; moved = true; }
+  x = Math.max(0, Math.min(canvas.width, x));
+  y = Math.max(0, Math.min(canvas.height, y));
+  if (moved) {
+    players[myId].x = x;
+    players[myId].y = y;
+    socket.emit('playerMove', { x, y });
+    draw();
+  }
+}
+
+function updateStatus() {
+  const aliveCount = Object.values(players).filter(p => p.alive).length;
+  statusDiv.innerText = `생존자 수: ${aliveCount}`;
+}
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width, canvas.height);
+
+  ctx.fillStyle = 'rgba(0,200,0,0.2)';
+  ctx.beginPath();
+  ctx.arc(zone.x, zone.y, zone.radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'green';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(zone.x, zone.y, zone.radius, 0, Math.PI * 2);
+  ctx.stroke();
+
+  for (const id in players) {
+    const p = players[id];
+    if (!
